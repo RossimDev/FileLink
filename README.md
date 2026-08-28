@@ -71,10 +71,43 @@ Ou conecte diretamente este repositório na Vercel (Framework Preset = **Other**
 
 ### 5. PC ↔ celular no 4G/5G (CGNAT)
 
-O Peer passa a ser criado com `PEER_CONFIG.iceServers`: STUN do Google/Twilio
-e TURN público `openrelay.metered.ca` (portas 80, 443 e `443?transport=tcp`,
-usuário/senha `openrelayproject`). Sem TURN, NAT simétrico das operadoras
-impede o furo de NAT.
+O Peer é criado com `PEER_CONFIG.iceServers`: STUN do Google/Cloudflare/Twilio
+mais um servidor TURN. Sem TURN, o NAT simétrico das operadoras impede o furo
+de NAT.
+
+**TURN dedicado (Metered.ca) em vez do relay público compartilhado.** O relay
+público `openrelay.metered.ca` (usuário/senha `openrelayproject`) é gratuito,
+porém **compartilhado por todo mundo** — sobrecarregado, ele é a causa das
+conexões instáveis/lentas em 4G/5G. Agora o app busca credenciais **dedicadas
+e temporárias** de uma conta gratuita própria no Metered.ca.
+
+Como configurar (grátis):
+
+1. Crie uma conta em <https://dashboard.metered.ca> → menu **TURN Server**.
+2. Anote o **subdomínio** do seu app (ex.: `filelink` → `filelink.metered.live`)
+   e a **API Key**.
+3. Preencha as duas constantes no topo do bloco de config (em **`app.js`** e,
+   se usar a versão single-file, também em **`standalone.html`**):
+
+   ```js
+   const METERED = {
+     subdomain: 'SEU_SUBDOMINIO_METERED', // ex.: 'filelink'
+     apiKey: 'SUA_API_KEY_METERED',       // API Key do painel
+   };
+   ```
+
+Como funciona:
+
+- Antes de abrir a conexão, `resolveIceConfig()` chama
+  `https://SUBDOMINIO.metered.live/api/v1/turn/credentials?apiKey=...` e usa a
+  lista de `iceServers` devolvida (credenciais **temporárias**, que expiram
+  sozinhas — seguras de chamar do navegador). Há timeout de 6 s e cache de
+  5 min para não pedir a cada conexão.
+- **Fallback automático:** se os placeholders ainda não estiverem preenchidos,
+  ou se a API falhar/expirar, o app volta sozinho para os STUN + o TURN público
+  `openrelay` — ou seja, nunca fica sem TURN e não quebra.
+- Enquanto busca as credenciais, a tela mostra *“Preparando servidores de rede
+  (TURN)…”*.
 
 - `peer.on('disconnected')` chama `peer.reconnect()` se ainda estiver desconectado.
 - Estado ICE (`oniceconnectionstatechange`) aparece na tela (“Negociando rota de rede…”).

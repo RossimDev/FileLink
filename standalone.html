@@ -836,28 +836,109 @@ a.dl {
   const MAX_SEND_RETRIES = 3; // tentativas ao colidir com buffer cheio/erros transitórios
   const RETRY_BACKOFF_MS = [250, 600, 1200]; // espera crescente entre tentativas
 
-  const PEER_CONFIG = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:global.stun.twilio.com:3478' },
-      {
-        urls: 'turn:openrelay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-    ],
+  // ---------------------------------------------------------------- TURN/ICE
+  //
+  // Conta gratuita própria no Metered.ca (credenciais DEDICADAS em vez do
+  // relay público compartilhado). Crie uma conta em https://dashboard.metered.ca
+  // -> "TURN Server" e preencha os dois campos abaixo:
+  //
+  //   subdomain: o subdomínio do seu app (ex.: 'filelink' vira filelink.metered.live)
+  //   apiKey:    a "API Key" que aparece no painel
+  //
+  // As credenciais são buscadas dinamicamente e são TEMPORÁRIAS (expiram sozinhas),
+  // então é seguro chamá-las do navegador a cada conexão.
+  const METERED = {
+    subdomain: 'SEU_SUBDOMINIO_METERED', // <-- ex.: 'filelink' (de filelink.metered.live)
+    apiKey: 'SUA_API_KEY_METERED', // <-- cole a API Key do painel Metered
   };
+
+  // STUN sempre incluídos (leves e ajudam a achar a rota mais direta).
+  const STUN_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+  ];
+
+  // Fallback usado só se a API da Metered não estiver configurada ou falhar:
+  // volta ao TURN público compartilhado (openrelay) para não deixar o app sem TURN.
+  const FALLBACK_ICE = [
+    ...STUN_SERVERS,
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+  ];
+
+  const meteredConfigured = () =>
+    METERED.subdomain &&
+    METERED.apiKey &&
+    !METERED.subdomain.startsWith('SEU_') &&
+    !METERED.apiKey.startsWith('SUA_');
+
+  // Cache curto: reaproveita as credenciais por alguns minutos entre conexões.
+  const ICE_CACHE_MS = 5 * 60 * 1000;
+  let iceCache = { at: 0, servers: null };
+
+  // Config padrão (fallback) usada de forma síncrona quando ainda não buscamos nada.
+  let PEER_CONFIG = { iceServers: FALLBACK_ICE };
+
+  async function fetchMeteredIce() {
+    const url =
+      `https://${METERED.subdomain}.metered.live/api/v1/turn/credentials` +
+      `?apiKey=${encodeURIComponent(METERED.apiKey)}`;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 6000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const list = await res.json();
+      if (!Array.isArray(list) || list.length === 0) {
+        throw new Error('resposta vazia da Metered');
+      }
+      // Junta STUN locais + os servidores (STUN/TURN) dedicados da conta.
+      return [...STUN_SERVERS, ...list];
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // Resolve a config de ICE a usar antes de criar o Peer.
+  async function resolveIceConfig() {
+    if (!meteredConfigured()) {
+      // Placeholders ainda não preenchidos: usa o fallback público.
+      console.warn(
+        'Metered.ca não configurado (preencha METERED.subdomain/apiKey). ' +
+          'Usando TURN público compartilhado como fallback.'
+      );
+      PEER_CONFIG = { iceServers: FALLBACK_ICE };
+      return PEER_CONFIG;
+    }
+    const now = Date.now();
+    if (iceCache.servers && now - iceCache.at < ICE_CACHE_MS) {
+      PEER_CONFIG = { iceServers: iceCache.servers };
+      return PEER_CONFIG;
+    }
+    try {
+      const servers = await fetchMeteredIce();
+      iceCache = { at: now, servers };
+      PEER_CONFIG = { iceServers: servers };
+    } catch (e) {
+      console.warn('Falha ao buscar credenciais Metered; usando fallback.', e);
+      PEER_CONFIG = { iceServers: FALLBACK_ICE };
+    }
+    return PEER_CONFIG;
+  }
 
   function peerErrorMessage(err) {
     const type = (err && err.type) || '';
@@ -1395,11 +1476,14 @@ a.dl {
     });
   }
 
-  function startHost() {
+  async function startHost() {
     const code = randomCode();
     $('host-code').textContent = code;
-    $('host-status').textContent = 'Aguardando conexão do celular...';
+    $('host-status').textContent = 'Preparando servidores de rede (TURN)...';
     showScreen('screen-host');
+
+    await resolveIceConfig();
+    $('host-status').textContent = 'Aguardando conexão do celular...';
 
     if (state.peer) state.peer.destroy();
     const peer = newPeer(ID_PREFIX + code);
@@ -1433,7 +1517,7 @@ a.dl {
     setTimeout(() => $('join-code').focus(), 120);
   }
 
-  function doConnect() {
+  async function doConnect() {
     const code = ($('join-code').value || '').trim().toUpperCase();
     if (code.length < 4) {
       $('join-status').textContent = 'Digite o código completo.';
@@ -1443,7 +1527,7 @@ a.dl {
     if ($('btn-connect').disabled) return; // evita clique duplo enquanto conecta
 
     $('btn-connect').disabled = true;
-    $('join-status').textContent = 'Conectando...';
+    $('join-status').textContent = 'Preparando servidores de rede (TURN)...';
     $('join-status').className = 'status';
 
     // Garante que o botão SEMPRE volta a ficar clicável (nunca trava).
@@ -1456,6 +1540,9 @@ a.dl {
       $('join-status').textContent = msg;
       $('join-status').className = 'status err';
     };
+
+    await resolveIceConfig();
+    $('join-status').textContent = 'Conectando...';
 
     if (state.peer) state.peer.destroy();
     let peer;
