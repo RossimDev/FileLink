@@ -1,642 +1,1271 @@
 /* =========================================================================
+
    FileLink Web — transferência P2P de arquivos pelo navegador (WebRTC)
+
    -------------------------------------------------------------------------
+
    Correções principais desta versão:
+
    1. NUNCA carrega o arquivo inteiro na memória. Lê em fatias de 64 KB com
+
       file.slice().arrayBuffer(). Era isso que travava .apk/.pck grandes.
+
    2. Respeita backpressure do RTCDataChannel (bufferedAmount). Sem isso o
+
       canal enche, o navegador bloqueia e a aba congela.
+
    3. Cede o controle ao event loop entre as fatias -> a UI nunca trava.
+
    4. Zero dependência de MIME type. .pck, .apk, .bin e afins têm file.type
+
       vazio; tudo é tratado como binário puro (application/octet-stream).
+
    5. Fala direto com o RTCDataChannel, sem a camada de serialização do
+
       PeerJS (que refragmenta e corrompe binários grandes).
+
+   6. TURN dinâmico via conta própria do Metered (serverless /api/turn-
+
+      credentials), com fallback pro relay público caso a API falhe.
+
    ========================================================================= */
 
 (() => {
+
   'use strict';
 
+
+
   // ----------------------------------------------------------------- config
+
   const CHUNK_SIZE = 64 * 1024; // 64 KB por fatia
+
   const BUFFER_HIGH = 8 * 1024 * 1024; // pausa de enviar acima disso
+
   const BUFFER_LOW = 1 * 1024 * 1024; // volta a enviar abaixo disso
+
   const ID_PREFIX = 'filelink-web-';
+
   const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sem I,O,0,1
+
   const JOIN_TIMEOUT_MS = 30000;
-  const MAX_SEND_RETRIES = 3; // tentativas ao colidir com buffer cheio/erros transitórios
-  const RETRY_BACKOFF_MS = [250, 600, 1200]; // espera crescente entre tentativas
 
-  const PEER_CONFIG = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:global.stun.twilio.com:3478' },
-      {
-        urls: 'turn:openrelay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-    ],
-  };
+  const MAX_SEND_RETRIES = 3;
 
-  function peerErrorMessage(err) {
-    const type = (err && err.type) || '';
-    if (type === 'peer-unavailable') {
-      return 'Código não encontrado (peer-unavailable). Confira no computador.';
-    }
-    if (type === 'network') {
-      return 'Falha de rede (network). Verifique a conexão e tente de novo.';
-    }
-    if (type === 'server-error') {
-      return 'O servidor de sinalização falhou (server-error). Tente novamente.';
-    }
-    if (type === 'unavailable-id') {
-      return 'Este código já está em uso. Gerando outro...';
-    }
-    return `Erro: ${type || (err && err.message) || err}`;
+  const RETRY_BACKOFF_MS = [250, 600, 1200];
+
+
+
+  // Fallback caso /api/turn-credentials falhe (mantém o app funcionando
+
+  // mesmo se a conta do Metered estiver indisponível).
+
+  const FALLBACK_ICE_SERVERS = [
+
+    { urls: 'stun:stun.l.google.com:19302' },
+
+    { urls: 'stun:stun.cloudflare.com:3478' },
+
+    { urls: 'stun:global.stun.twilio.com:3478' },
+
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+
+  ];
+
+
+
+  let cachedIceServers = null;
+
+  let iceServersPromise = null;
+
+
+
+  /**
+
+   * Busca credenciais TURN dedicadas (conta Metered) via serverless function
+
+   * da Vercel. A API Key nunca aparece no navegador — fica só no servidor.
+
+   * Se a chamada falhar, cai no fallback público (Openrelay + STUN).
+
+   */
+
+  function fetchIceServers() {
+
+    if (cachedIceServers) return Promise.resolve(cachedIceServers);
+
+    if (iceServersPromise) return iceServersPromise;
+
+
+
+    iceServersPromise = fetch('/api/turn-credentials')
+
+      .then((r) => {
+
+        if (!r.ok) throw new Error(`status ${r.status}`);
+
+        return r.json();
+
+      })
+
+      .then((data) => {
+
+        if (!Array.isArray(data.iceServers) || data.iceServers.length === 0) {
+
+          throw new Error('resposta vazia');
+
+        }
+
+        cachedIceServers = data.iceServers;
+
+        return cachedIceServers;
+
+      })
+
+      .catch((err) => {
+
+        console.warn('Não consegui buscar TURN do Metered, usando fallback público.', err);
+
+        cachedIceServers = FALLBACK_ICE_SERVERS;
+
+        return cachedIceServers;
+
+      });
+
+
+
+    return iceServersPromise;
+
   }
 
+
+
+  function peerErrorMessage(err) {
+
+    const type = (err && err.type) || '';
+
+    if (type === 'peer-unavailable') {
+
+      return 'Código não encontrado (peer-unavailable). Confira no computador.';
+
+    }
+
+    if (type === 'network') {
+
+      return 'Falha de rede (network). Verifique a conexão e tente de novo.';
+
+    }
+
+    if (type === 'server-error') {
+
+      return 'O servidor de sinalização falhou (server-error). Tente novamente.';
+
+    }
+
+    if (type === 'unavailable-id') {
+
+      return 'Este código já está em uso. Gerando outro...';
+
+    }
+
+    return `Erro: ${type || (err && err.message) || err}`;
+
+  }
+
+
+
   // ------------------------------------------------------------------ state
+
   const state = {
+
     peer: null,
+
     conn: null,
+
     dc: null,
+
     connected: false,
-    /** @type {Array<Object>} fila + enviados */
+
     outgoing: [],
-    /** @type {Array<Object>} recebidos */
+
     incoming: [],
-    /** transferência entrando no momento */
+
     receiving: null,
+
     pumping: false,
+
     seq: 0,
+
   };
+
+
 
   const uid = () => `f${Date.now().toString(36)}${(state.seq++).toString(36)}`;
 
+
+
   // --------------------------------------------------------------- utilidades
+
   const $ = (id) => document.getElementById(id);
 
+
+
   function fmtBytes(n) {
+
     if (!Number.isFinite(n) || n < 0) return '—';
+
     if (n < 1024) return `${n} B`;
+
     const u = ['KB', 'MB', 'GB', 'TB'];
+
     let i = -1;
+
     do {
+
       n /= 1024;
+
       i++;
+
     } while (n >= 1024 && i < u.length - 1);
+
     return `${n.toFixed(n < 10 ? 1 : 0)} ${u[i]}`;
+
   }
 
-  /** Extensão em MAIÚSCULO — a chave de agrupamento das listas. */
+
+
   function extOf(name) {
+
     const m = /\.([A-Za-z0-9_+-]{1,12})$/.exec(name || '');
+
     return m ? m[1].toUpperCase() : 'SEM EXTENSÃO';
+
   }
+
+
 
   function escapeHtml(s) {
+
     return String(s).replace(
+
       /[&<>"']/g,
+
       (c) =>
+
         ({
+
           '&': '&amp;',
+
           '<': '&lt;',
+
           '>': '&gt;',
+
           '"': '&quot;',
+
           "'": '&#39;',
+
         })[c],
+
     );
+
   }
+
+
 
   function randomCode(n = 6) {
+
     const a = new Uint32Array(n);
+
     crypto.getRandomValues(a);
+
     let s = '';
+
     for (let i = 0; i < n; i++) s += ALPHABET[a[i] % ALPHABET.length];
+
     return s;
+
   }
+
+
 
   function toast(msg, kind = '') {
+
     const box = $('toasts');
+
     const el = document.createElement('div');
+
     el.className = `toast ${kind}`;
+
     el.textContent = msg;
+
     box.appendChild(el);
+
     setTimeout(() => {
+
       el.style.opacity = '0';
+
       el.style.transition = 'opacity .25s';
+
       setTimeout(() => el.remove(), 260);
+
     }, 3200);
+
   }
+
+
 
   function showScreen(id) {
+
     document
+
       .querySelectorAll('.screen')
+
       .forEach((s) => s.classList.toggle('is-active', s.id === id));
+
   }
 
-  // =======================================================================
-  //  RENDER
+
+
   // =======================================================================
 
-  /** Agrupa itens por extensão e devolve pares [ext, itens] ordenados. */
+  // RENDER
+
+  // =======================================================================
+
   function groupByExt(items) {
+
     const map = new Map();
+
     for (const it of items) {
+
       if (!map.has(it.ext)) map.set(it.ext, []);
+
       map.get(it.ext).push(it);
+
     }
+
     return [...map.entries()].sort((a, b) => {
+
       if (a[0] === 'SEM EXTENSÃO') return 1;
+
       if (b[0] === 'SEM EXTENSÃO') return -1;
+
       return a[0].localeCompare(b[0], 'pt-BR');
+
     });
+
   }
+
+
 
   const STATUS_LABEL = {
+
     pending: 'Na fila',
+
     sending: 'Enviando',
+
     sent: 'Enviado',
+
     cancelled: 'Cancelado',
+
     error: 'Erro',
+
   };
 
-  /** Monta o HTML de um grupo (uma extensão = uma lista separada). */
+
+
   function groupHtml(ext, items, rowFn) {
+
     return `
-      <div class="group">
-        <div class="group-head">
-          <span class="chip">${escapeHtml(ext)}</span>
-          <span class="n">${items.length} ${items.length === 1 ? 'arquivo' : 'arquivos'}</span>
-        </div>
-        ${items.map(rowFn).join('')}
-      </div>`;
+
+    <div class="group">
+
+      <div class="group-head">
+
+        <span class="chip">${escapeHtml(ext)}</span>
+
+        <span class="n">${items.length} ${items.length === 1 ? 'arquivo' : 'arquivos'}</span>
+
+      </div>
+
+      ${items.map(rowFn).join('')}
+
+    </div>`;
+
   }
+
+
 
   function outgoingRow(it) {
+
     const pct = it.size ? Math.min(100, (it.sent / it.size) * 100) : 0;
+
     let acts = '';
+
     if (it.status === 'pending') {
+
       acts = `
+
         <button class="btn btn-tiny btn-warn-ghost" data-act="cancel" data-id="${it.id}">Cancelar</button>
+
         <button class="btn btn-tiny btn-danger-ghost" data-act="remove" data-id="${it.id}">Excluir</button>`;
+
     } else if (it.status === 'sending') {
+
       acts = `<button class="btn btn-tiny btn-warn-ghost" data-act="cancel" data-id="${it.id}">Cancelar</button>`;
+
     } else if (it.status === 'error' || it.status === 'cancelled') {
-      // erro/cancelado: permite tentar de novo + excluir
+
       acts = `
+
         <button class="btn btn-tiny btn-ghost" data-act="retry" data-id="${it.id}">Tentar novamente</button>
+
         <button class="btn btn-tiny btn-danger-ghost" data-act="remove" data-id="${it.id}">Excluir</button>`;
+
     } else {
-      // enviado
+
       acts = `<button class="btn btn-tiny btn-danger-ghost" data-act="remove" data-id="${it.id}">Excluir</button>`;
+
     }
+
+
+
     const showBar = it.status === 'sending' || it.status === 'pending';
+
     return `
-      <div class="item">
-        <div class="item-main">
-          <div class="item-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
-          <div class="item-meta">
-            <span class="tag ${it.status}">${STATUS_LABEL[it.status]}</span>
-            <span>${fmtBytes(it.size)}</span>
-            ${it.status === 'sending' ? `<span>${pct.toFixed(0)}%</span>` : ''}
-          </div>
-          ${showBar ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
+
+    <div class="item">
+
+      <div class="item-main">
+
+        <div class="item-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+
+        <div class="item-meta">
+
+          <span class="tag ${it.status}">${STATUS_LABEL[it.status]}</span>
+
+          <span>${fmtBytes(it.size)}</span>
+
+          ${it.status === 'sending' ? `<span>${pct.toFixed(0)}%</span>` : ''}
+
         </div>
-        <div class="item-acts">${acts}</div>
-      </div>`;
+
+        ${showBar ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
+
+      </div>
+
+      <div class="item-acts">${acts}</div>
+
+    </div>`;
+
   }
+
+
 
   function incomingRow(it) {
+
     const done = it.status === 'done';
+
     const pct = it.size ? Math.min(100, (it.recv / it.size) * 100) : 0;
+
     return `
-      <div class="item">
-        <div class="item-main">
-          <div class="item-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
-          <div class="item-meta">
-            <span>${fmtBytes(it.size)}</span>
-            ${done ? '' : `<span>${pct.toFixed(0)}%</span>`}
-          </div>
-          ${done ? '' : `<div class="bar"><i style="width:${pct}%"></i></div>`}
+
+    <div class="item">
+
+      <div class="item-main">
+
+        <div class="item-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+
+        <div class="item-meta">
+
+          <span>${fmtBytes(it.size)}</span>
+
+          ${done ? '' : `<span>${pct.toFixed(0)}%</span>`}
+
         </div>
-        <div class="item-acts">
-          ${
-            done
-              ? `<a class="dl" href="${it.url}" download="${escapeHtml(it.name)}">Baixar</a>`
-              : ''
-          }
-          <button class="btn btn-tiny btn-danger-ghost" data-act="remove-recv" data-id="${it.id}">Excluir</button>
-        </div>
-      </div>`;
+
+        ${done ? '' : `<div class="bar"><i style="width:${pct}%"></i></div>`}
+
+      </div>
+
+      <div class="item-acts">
+
+        ${done ? `<a class="dl" href="${it.url}" download="${escapeHtml(it.name)}">Baixar</a>` : ''}
+
+        <button class="btn btn-tiny btn-danger-ghost" data-act="remove-recv" data-id="${it.id}">Excluir</button>
+
+      </div>
+
+    </div>`;
+
   }
+
+
 
   let renderQueued = false;
+
   function render() {
+
     if (renderQueued) return;
+
     renderQueued = true;
+
     requestAnimationFrame(() => {
+
       renderQueued = false;
+
       doRender();
+
     });
+
   }
+
+
 
   function doRender() {
+
     const queue = state.outgoing.filter((i) => i.status !== 'sent');
+
     const sent = state.outgoing.filter((i) => i.status === 'sent');
 
+
+
     $('panel-queue').hidden = queue.length === 0;
+
     $('queue-count').textContent = String(queue.length);
+
     $('queue-groups').innerHTML = groupByExt(queue)
+
       .map(([e, items]) => groupHtml(e, items, outgoingRow))
+
       .join('');
+
+
 
     $('panel-sent').hidden = sent.length === 0;
+
     $('sent-count').textContent = String(sent.length);
+
     $('sent-groups').innerHTML = groupByExt(sent)
+
       .map(([e, items]) => groupHtml(e, items, outgoingRow))
+
       .join('');
+
+
 
     $('panel-recv').hidden = state.incoming.length === 0;
+
     $('recv-count').textContent = String(state.incoming.length);
+
     $('recv-groups').innerHTML = groupByExt(state.incoming)
+
       .map(([e, items]) => groupHtml(e, items, incomingRow))
+
       .join('');
+
   }
 
+
+
   // =======================================================================
-  //  TRANSPORTE
+
+  // TRANSPORTE
+
   // =======================================================================
 
   const sendCtl = (obj) => {
+
     if (state.dc && state.dc.readyState === 'open')
+
       state.dc.send(JSON.stringify(obj));
+
   };
 
-  /** Espera o buffer do canal esvaziar. É o que impede o congelamento. */
+
+
   function waitForDrain() {
+
     const dc = state.dc;
+
     if (!dc || dc.bufferedAmount < BUFFER_HIGH) return Promise.resolve();
+
     return new Promise((resolve) => {
+
       const tick = () => {
+
         if (!state.dc || state.dc.readyState !== 'open') return resolve();
+
         if (state.dc.bufferedAmount <= BUFFER_LOW) return resolve();
+
         setTimeout(tick, 25);
+
       };
+
       setTimeout(tick, 25);
+
     });
+
   }
 
+
+
   const nextTick = () => new Promise((r) => setTimeout(r, 0));
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /** Envia um arquivo em fatias, sem nunca bloquear a thread principal. */
+
+
   async function sendOne(item) {
+
     const file = item.file;
+
     item.status = 'sending';
+
     item.sent = 0;
+
     render();
 
-    sendCtl({
-      t: 'start',
-      id: item.id,
-      name: file.name,
-      size: file.size,
-      ext: item.ext,
-    });
+
+
+    sendCtl({ t: 'start', id: item.id, name: file.name, size: file.size, ext: item.ext });
+
+
 
     let offset = 0;
+
     let lastPaint = 0;
 
+
+
     while (offset < file.size) {
+
       if (item.cancelRequested) {
+
         sendCtl({ t: 'cancel', id: item.id });
+
         item.status = 'cancelled';
+
         render();
+
         return;
+
       }
+
+
+
       if (!state.dc || state.dc.readyState !== 'open') {
+
         item.status = 'error';
+
         render();
+
         return;
+
       }
+
+
 
       await waitForDrain();
 
+
+
       const end = Math.min(offset + CHUNK_SIZE, file.size);
+
       let buf;
+
       try {
-        // lê SÓ esta fatia — o arquivo inteiro nunca entra na memória
+
         buf = await file.slice(offset, end).arrayBuffer();
+
       } catch (err) {
+
         console.error('Falha ao ler fatia do arquivo', err);
+
         sendCtl({ t: 'cancel', id: item.id });
+
         item.status = 'error';
+
         render();
+
         toast(`Erro ao ler "${file.name}"`, 'err');
+
         return;
+
       }
 
-      // envia com retry/backoff em erros transitórios (buffer cheio, etc.)
+
+
       let sent = false;
+
       for (let attempt = 0; attempt <= MAX_SEND_RETRIES; attempt++) {
+
         try {
+
           state.dc.send(buf);
+
           sent = true;
+
           break;
+
         } catch (err) {
-          console.warn(
-            `send falhou (tentativa ${attempt + 1}/${MAX_SEND_RETRIES + 1})`,
-            err,
-          );
+
+          console.warn(`send falhou (tentativa ${attempt + 1}/${MAX_SEND_RETRIES + 1})`, err);
+
           await waitForDrain();
+
           if (attempt < MAX_SEND_RETRIES) {
-            await sleep(
-              RETRY_BACKOFF_MS[Math.min(attempt, RETRY_BACKOFF_MS.length - 1)],
-            );
+
+            await sleep(RETRY_BACKOFF_MS[Math.min(attempt, RETRY_BACKOFF_MS.length - 1)]);
+
           }
+
         }
+
       }
+
+
+
       if (!sent) {
-        // avisa o outro lado para descartar o parcial antes de marcar erro
+
         sendCtl({ t: 'cancel', id: item.id });
+
         item.status = 'error';
+
         render();
+
         toast(`Falha ao enviar "${file.name}"`, 'err');
+
         return;
+
       }
+
+
 
       offset = end;
+
       item.sent = offset;
 
+
+
       const now = performance.now();
+
       if (now - lastPaint > 120) {
+
         lastPaint = now;
+
         render();
-        await nextTick(); // devolve o controle ao navegador
+
+        await nextTick();
+
       }
+
     }
+
+
 
     sendCtl({ t: 'end', id: item.id });
+
     item.sent = file.size;
+
     item.status = 'sent';
+
     render();
+
   }
 
-  /** Processa a fila, um arquivo por vez. */
+
+
   async function pump() {
+
     if (state.pumping) return;
+
     state.pumping = true;
+
     try {
+
       while (true) {
+
         const next = state.outgoing.find((i) => i.status === 'pending');
+
         if (!next) break;
+
         if (next.cancelRequested) {
+
           next.status = 'cancelled';
+
           render();
+
           continue;
+
         }
+
         await sendOne(next);
+
       }
+
     } finally {
+
       state.pumping = false;
+
     }
+
   }
+
+
 
   // ---------------------------------------------------------------- recepção
+
   function handleControl(msg) {
+
     switch (msg.t) {
+
       case 'start': {
-        // tentativa/reinício do mesmo arquivo: descarta parcial antigo
+
         state.incoming = state.incoming.filter(
+
           (i) => i.status !== 'receiving' || i.id !== msg.id,
+
         );
+
         state.receiving = {
+
           id: msg.id,
+
           name: msg.name,
+
           size: msg.size,
+
           ext: msg.ext || extOf(msg.name),
+
           parts: [],
+
           recv: 0,
+
           status: 'receiving',
+
         };
+
         state.incoming.unshift(state.receiving);
+
         render();
+
         break;
+
       }
+
       case 'end': {
+
         const r = state.receiving;
+
         if (!r || r.id !== msg.id) return;
-        // application/octet-stream => força download em vez de abrir
+
         const blob = new Blob(r.parts, { type: 'application/octet-stream' });
+
         r.url = URL.createObjectURL(blob);
-        r.parts = []; // libera memória
+
+        r.parts = [];
+
         r.status = 'done';
+
         r.recv = r.size;
+
         state.receiving = null;
+
         render();
+
         toast(`Recebido: ${r.name}`, 'ok');
+
         break;
+
       }
+
       case 'cancel': {
+
         const r = state.receiving;
+
         if (r && r.id === msg.id) {
+
           state.incoming = state.incoming.filter((i) => i !== r);
+
           state.receiving = null;
+
           render();
+
           toast(`Envio de "${r.name}" foi cancelado`, '');
+
         }
+
         break;
+
       }
+
     }
+
   }
+
+
 
   function handleBinary(data) {
+
     const r = state.receiving;
+
     if (!r) return;
+
     r.parts.push(data);
+
     r.recv += data.byteLength ?? data.size ?? 0;
+
     render();
+
   }
+
+
 
   function attachChannel(dc) {
+
     state.dc = dc;
+
     dc.binaryType = 'arraybuffer';
-    // Assume o onmessage: falamos direto com o canal, sem a serialização
-    // do PeerJS (que refragmenta e quebra binários grandes).
+
     dc.onmessage = (ev) => {
+
       const d = ev.data;
+
       if (typeof d === 'string') {
+
         try {
+
           handleControl(JSON.parse(d));
+
         } catch (e) {
+
           console.warn('controle inválido', e);
+
         }
+
       } else {
+
         handleBinary(d);
+
       }
+
     };
+
   }
 
-  // =======================================================================
-  //  CONEXÃO
+
+
   // =======================================================================
 
-  function newPeer(id) {
-    const peer = new Peer(id, { debug: 1, config: PEER_CONFIG });
+  // CONEXÃO
+
+  // =======================================================================
+
+
+
+  /** Agora assíncrona: espera as credenciais TURN antes de criar o Peer. */
+
+  async function newPeer(id) {
+
+    const iceServers = await fetchIceServers();
+
+    const peer = new Peer(id, { debug: 1, config: { iceServers } });
+
+
+
     peer.on('disconnected', () => {
+
       if (peer.destroyed || !peer.disconnected) return;
+
       try {
+
         peer.reconnect();
+
       } catch (e) {
+
         console.warn('peer.reconnect falhou', e);
+
       }
+
     });
+
+
+
     return peer;
+
   }
+
+
 
   function setIceUi(text, kind) {
+
     const host = $('host-status');
+
     const join = $('join-status');
+
     const connEl = $('conn-status');
+
     const ice = $('ice-status');
+
     if (ice) {
+
       ice.textContent = text;
+
       ice.className = 'status' + (kind ? ' ' + kind : '');
+
     }
+
     const apply = (el) => {
+
       if (!el) return;
+
       el.textContent = text;
+
       el.className = 'status' + (kind ? ' ' + kind : '');
+
     };
+
     if (!state.connected) {
+
       apply(host);
+
       apply(join);
+
     }
+
     if (connEl && state.connected) {
+
       /* keep connected label; ice-status shows path */
+
     }
+
   }
+
+
 
   function watchIce(conn) {
+
     const pc = conn.peerConnection;
+
     if (!pc) return;
+
     const apply = () => {
+
       const st = pc.iceConnectionState;
+
       if (st === 'checking' || st === 'new') {
+
         setIceUi('Negociando rota de rede...', '');
+
       } else if (st === 'connected' || st === 'completed') {
+
         setIceUi('Rota de rede estabelecida.', 'ok');
+
       } else if (st === 'disconnected') {
+
         setIceUi('Conexão ICE instável...', '');
+
       } else if (st === 'failed') {
+
         setIceUi('Falha de NAT/ICE. TURN pode não ter sido alcançado.', 'err');
+
       } else if (st === 'closed') {
+
         setIceUi('Conexão ICE encerrada.', 'err');
+
       } else {
+
         setIceUi('ICE: ' + st, '');
+
       }
+
     };
+
     pc.oniceconnectionstatechange = apply;
+
     apply();
+
   }
+
+
 
   function wireConnection(conn) {
+
     state.conn = conn;
+
     watchIce(conn);
+
+
+
     conn.on('open', () => {
+
       state.connected = true;
+
       attachChannel(conn.dataChannel);
+
       $('conn-status').textContent = 'Conectado';
+
       $('conn-status').className = 'status ok';
+
       showScreen('screen-transfer');
+
       toast('Conectado!', 'ok');
+
       render();
+
     });
+
+
+
     conn.on('close', () => {
+
       state.connected = false;
+
       $('conn-status').textContent = 'Conexão encerrada';
+
       $('conn-status').className = 'status err';
-      // marca o que estava em trânsito (permite tentar de novo depois)
+
       state.outgoing.forEach((i) => {
+
         if (i.status === 'sending') i.status = 'error';
+
       });
+
       state.incoming.forEach((i) => {
+
         if (i.status === 'receiving') i.status = 'error';
+
       });
+
       state.receiving = null;
+
       render();
+
       toast('Conexão encerrada', 'err');
+
     });
+
+
+
     conn.on('error', (err) => {
+
       console.error('conn error', err);
+
       toast('Erro na conexão', 'err');
+
     });
+
   }
 
-  function startHost() {
+
+
+  async function startHost() {
+
     const code = randomCode();
+
     $('host-code').textContent = code;
+
     $('host-status').textContent = 'Aguardando conexão do celular...';
+
     showScreen('screen-host');
 
+
+
     if (state.peer) state.peer.destroy();
-    const peer = newPeer(ID_PREFIX + code);
+
+
+
+    const peer = await newPeer(ID_PREFIX + code);
+
     state.peer = peer;
 
+
+
     peer.on('error', (err) => {
+
       console.error(err);
+
       if (err.type === 'unavailable-id') {
-        // código já em uso: sorteia outro
+
         startHost();
+
         return;
+
       }
+
       $('host-status').textContent = peerErrorMessage(err);
+
       $('host-status').className = 'status err';
+
     });
+
+
 
     peer.on('connection', (conn) => {
+
       if (state.conn && state.connected) {
+
         conn.close();
+
         return;
+
       }
+
       wireConnection(conn);
+
     });
+
   }
+
+
 
   function startJoin() {
+
     $('join-status').textContent = '';
+
     $('join-status').className = 'status';
+
     $('join-code').value = '';
+
     showScreen('screen-join');
+
     setTimeout(() => $('join-code').focus(), 120);
+
   }
 
-  function doConnect() {
+
+
+  async function doConnect() {
+
     const code = ($('join-code').value || '').trim().toUpperCase();
+
     if (code.length < 4) {
+
       $('join-status').textContent = 'Digite o código completo.';
+
       $('join-status').className = 'status err';
+
       return;
+
     }
-    if ($('btn-connect').disabled) return; // evita clique duplo enquanto conecta
+
+    if ($('btn-connect').disabled) return;
+
+
 
     $('btn-connect').disabled = true;
+
     $('join-status').textContent = 'Conectando...';
+
     $('join-status').className = 'status';
 
-    // Garante que o botão SEMPRE volta a ficar clicável (nunca trava).
+
+
     let openTimer = 0;
     let joinTimer = 0;
     const fail = (msg) => {
@@ -650,7 +1279,7 @@
     if (state.peer) state.peer.destroy();
     let peer;
     try {
-      peer = newPeer(undefined);
+      peer = await newPeer(undefined);
     } catch (err) {
       console.error('Não consegui criar o Peer.', err);
       $('btn-connect').disabled = false;

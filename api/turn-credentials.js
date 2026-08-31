@@ -4,6 +4,14 @@
    O app.js busca TURN dinâmico neste endpoint em vez de usar o relay
    público (openrelay). A chave da conta fica só no servidor, na variável
    de ambiente METERED_API_KEY — nunca vai para o cliente.
+
+   Formato da resposta (o que o app.js espera em data.iceServers):
+   {
+     "iceServers": [
+       { "urls": "stun:..." },
+       { "urls": "turn:...", "username": "...", "credential": "..." }
+     ]
+   }
    ========================================================================= */
 
 export default async function handler(req, res) {
@@ -30,11 +38,33 @@ export default async function handler(req, res) {
         .json({ error: `Metered respondeu HTTP ${resp.status}` });
     }
 
-    const creds = await resp.json();
+    const data = await resp.json();
+
+    // A API da Metered devolve um array [{urls, username, credential}].
+    // Normaliza para { iceServers: [...] } — o formato que o app.js espera —
+    // aceitando também { iceServers: [...] } ou { uris, username, password }.
+    let list = null;
+    if (Array.isArray(data)) {
+      list = data;
+    } else if (Array.isArray(data.iceServers)) {
+      list = data.iceServers;
+    } else if (Array.isArray(data.uris) && data.username) {
+      list = data.uris.map((u) => ({
+        urls: u,
+        username: data.username,
+        credential: data.password || data.credential,
+      }));
+    }
+
+    if (!list || list.length === 0) {
+      return res
+        .status(502)
+        .json({ error: 'Metered não retornou servidores TURN válidos.' });
+    }
 
     // Credenciais têm validade curta (ex.: 1h) — nunca usar cache.
     res.setHeader('Cache-Control', 'no-store, max-age=0');
-    return res.status(200).json(creds);
+    return res.status(200).json({ iceServers: list });
   } catch (err) {
     return res.status(500).json({
       error: 'Falha ao obter credenciais TURN.',
