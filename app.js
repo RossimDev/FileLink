@@ -54,6 +54,14 @@
 
   const RETRY_BACKOFF_MS = [250, 600, 1200];
 
+  // Reconexão com o servidor de sinalização: LIMITADA, com backoff.
+
+  // Antes era peer.reconnect() a cada 'disconnected', sem teto -> loop infinito.
+
+  const MAX_RECONNECT_ATTEMPTS = 3;
+
+  const RECONNECT_BACKOFF_MS = [1000, 2000, 4000];
+
 
 
   // Fallback caso /api/turn-credentials falhe (mantém o app funcionando
@@ -978,19 +986,73 @@
 
 
 
+    // Reconexão LIMITADA: no máximo MAX_RECONNECT_ATTEMPTS tentativas, com
+
+    // backoff. Sem isso, quando a sinalização caía de vez o app entrava em
+
+    // loop infinito de reconexão e a tela travava em "conectando...".
+
+    let reconnectAttempts = 0;
+
+    let reconnectTimer = 0;
+
+
+
+    peer.on('open', () => {
+
+      reconnectAttempts = 0; // conexão OK -> zera o contador
+
+    });
+
+
+
+    peer.on('close', () => {
+
+      clearTimeout(reconnectTimer);
+
+    });
+
+
+
     peer.on('disconnected', () => {
 
       if (peer.destroyed || !peer.disconnected) return;
 
-      try {
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
 
-        peer.reconnect();
+        console.warn('Limite de reconexões atingido. Desistindo.');
 
-      } catch (e) {
+        setIceUi('Conexão com o servidor perdida. Recarregue a página e tente de novo.', 'err');
 
-        console.warn('peer.reconnect falhou', e);
+        try { peer.destroy(); } catch (_) { /* já destruído */ }
+
+        return;
 
       }
+
+      reconnectAttempts += 1;
+
+      const delay = RECONNECT_BACKOFF_MS[Math.min(reconnectAttempts - 1, RECONNECT_BACKOFF_MS.length - 1)];
+
+      console.warn(`Sinalização caiu. Reconectando (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) em ${delay}ms...`);
+
+      clearTimeout(reconnectTimer);
+
+      reconnectTimer = setTimeout(() => {
+
+        if (peer.destroyed || !peer.disconnected) return;
+
+        try {
+
+          peer.reconnect();
+
+        } catch (e) {
+
+          console.warn('peer.reconnect falhou', e);
+
+        }
+
+      }, delay);
 
     });
 
@@ -1166,11 +1228,21 @@
 
   async function startHost() {
 
+    // Peer ANTES do código: o código só aparece quando o registro no servidor
+
+    // de sinalização é confirmado ('open'). Antes, o código era exibido na
+
+    // hora e o celular podia tentar conectar num ID que ainda não existia ->
+
+    // peer-unavailable -> usuário tentava de novo -> loop de conexão.
+
     const code = randomCode();
 
-    $('host-code').textContent = code;
+    $('host-code').textContent = '······';
 
-    $('host-status').textContent = 'Aguardando conexão do celular...';
+    $('host-status').textContent = 'Preparando conexão...';
+
+    $('host-status').className = 'status';
 
     showScreen('screen-host');
 
@@ -1180,9 +1252,37 @@
 
 
 
-    const peer = await newPeer(ID_PREFIX + code);
+    let peer;
+
+    try {
+
+      peer = await newPeer(ID_PREFIX + code);
+
+    } catch (err) {
+
+      console.error('Não consegui criar o Peer.', err);
+
+      $('host-status').textContent = 'Não consegui iniciar a conexão. Recarregue a página e tente de novo.';
+
+      $('host-status').className = 'status err';
+
+      return;
+
+    }
 
     state.peer = peer;
+
+
+
+    peer.on('open', () => {
+
+      $('host-code').textContent = code;
+
+      $('host-status').textContent = 'Aguardando conexão do celular...';
+
+      $('host-status').className = 'status';
+
+    });
 
 
 

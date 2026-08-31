@@ -112,6 +112,30 @@ Arquivos que **falharam** (status *Erro*) ou foram **cancelados** (status
   quando a negociação TURN/ICE travou e você quer tentar de novo sem voltar ao
   início.
 
+### 7. Conexão travada em loop (reconexão limitada, peer antes do código)
+
+Duas causas do app ficar preso em "conectando..." para sempre, corrigidas:
+
+- **Reconexão limitada:** `peer.on('disconnected')` chamava `peer.reconnect()`
+  sem teto — se o servidor de sinalização caísse de vez, o app entrava em loop
+  infinito de reconexão. Agora são no máximo **3 tentativas** com backoff
+  (1 s → 2 s → 4 s); o contador zera quando a conexão volta (`open`). Esgotadas
+  as tentativas, o peer é destruído e a tela pede para recarregar a página.
+- **Peer antes do código:** o código de 6 caracteres era exibido **antes** de o
+  peer existir no servidor de sinalização. O celular tentava conectar num ID
+  que ainda não estava registrado → `peer-unavailable` → o usuário tentava de
+  novo → loop. Agora o código só aparece **depois** do `peer.on('open')` —
+  enquanto isso a tela mostra "Preparando conexão...".
+
+### 8. TURN dedicado (Metered) sem configuração
+
+O endpoint serverless `api/turn-credentials.js` agora traz a chave da conta
+Metered **embutida** — o deploy funciona sem configurar nada na Vercel. Se a
+variável de ambiente `METERED_API_KEY` for configurada depois, **ela tem
+precedência** sobre a chave embutida. A chave nunca chega ao navegador: o
+cliente só recebe as credenciais TURN temporárias. Se o endpoint falhar, o
+`app.js` cai no fallback público (openrelay).
+
 ## Limitação conhecida
 
 O arquivo recebido é montado na memória do navegador antes de virar download.
