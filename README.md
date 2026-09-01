@@ -1,144 +1,74 @@
-# FileLink Web
+# LoopSync
 
-Transferência de arquivos **direto de um aparelho para o outro** (P2P via WebRTC),
-rodando 100% no navegador. Nenhum arquivo passa por servidor: só o *handshake*
-inicial usa um servidor público gratuito (broker do PeerJS).
+**Vídeo + música. Automaticamente.**
 
-## O que foi corrigido nesta versão
+O LoopSync junta **1 vídeo** e **1 áudio** num único vídeo:
 
-### 1. Travamento com `.pck`, `.apk`, `.bin` e outros binários
+> PEGAR UM VÍDEO + PEGAR UM ÁUDIO → REPETIR/CORTAR O VÍDEO ATÉ FICAR COM A
+> MESMA DURAÇÃO DO ÁUDIO → EXPORTAR O RESULTADO.
 
-O congelamento **não era causado pelo tipo do arquivo** — era causado pelo tamanho
-e pela forma como o arquivo era lido/enviado. Três causas, todas corrigidas:
+O vídeo é repetido (em loop) até cobrir toda a duração do áudio. Quando chega
+no final, o último loop é cortado no ponto exato, para que o vídeo final termine
+**exatamente** na duração do áudio.
 
-| Problema | Correção |
-|---|---|
-| O arquivo inteiro era lido para a memória de uma vez | Agora lê em fatias de 64 KB com `file.slice().arrayBuffer()` |
-| Todas as fatias eram empurradas no canal sem checar `bufferedAmount` | Backpressure real: pausa acima de 8 MB no buffer, volta abaixo de 1 MB |
-| O laço de envio nunca devolvia o controle ao navegador | `await` no event loop a cada ~120 ms → a UI nunca congela |
+- Se o vídeo for **maior que o áudio**, usa só os primeiros segundos do vídeo.
+- Se tiverem a mesma duração, não repete.
+- Se o vídeo for menor, repete o quanto for preciso.
 
-### 2. Suporte a qualquer tipo de arquivo
+O **audio do vídeo original é descartado** — a trilha sonora é apenas o arquivo
+de áudio escolhido pelo usuário.
 
-- Zero dependência de MIME type. `.pck`, `.apk` e `.bin` têm `file.type` **vazio** —
-  qualquer lógica baseada em MIME quebrava neles.
-- A camada de serialização do PeerJS (que refragmenta e corrompe binários grandes)
-  foi contornada: falamos direto com o `RTCDataChannel`, enviando controle como
-  JSON (string) e conteúdo como `ArrayBuffer` puro.
-- No download, o Blob é criado como `application/octet-stream`, o que força o
-  download em vez de o navegador tentar abrir/renderizar o arquivo.
+Não há filtros, efeitos, transições, zoom, texto, marca d'água, IA, nem
+"montagens inteligentes". A única operação sobre o vídeo é:
+**REPETIR → REPETIR → CORTAR O FINAL QUANDO NECESSÁRIO.**
 
-### 3. Excluir e cancelar
+## Privacidade
 
-- **Na fila (não enviados):** botões **Cancelar** e **Excluir**.
-- **Enviando agora:** botão **Cancelar** (avisa o outro lado, que descarta o parcial).
-- **Enviados:** botão **Excluir** para sair da lista.
-- **Recebidos:** botão **Excluir** (também libera o `ObjectURL` da memória).
-- Ações em massa: *Cancelar tudo* e *Limpar lista*.
+Todo o processamento acontece **no próprio aparelho** (navegador), usando
+`ffmpeg.wasm`. Nenhum vídeo ou música é enviado para servidores. Não é preciso
+criar conta nem entrar. Os arquivos temporários são descartados ao final de
+cada geração.
 
-### 4. Listas separadas por tipo
+## Como usar
 
-Fila, Enviados e Recebidos são agrupados **por extensão**: APK só com APK,
-BIN só com BIN, TXT só com TXT, e assim por diante. Cada grupo mostra o
-selo da extensão e a contagem de arquivos. Arquivos sem extensão vão para
-um grupo "SEM EXTENSÃO" no fim.
+1. Escolher **1 vídeo**.
+2. Escolher **1 áudio / música**.
+3. Tocar em **Gerar vídeo**.
+4. Salvar ou compartilhar o resultado (`.mp4`).
+
+O resultado é salvo com um nome como `LoopSync_2026-08-31_125000.mp4`.
 
 ## Rodando localmente
 
+É um site estático (sem build):
+
 ```bash
-python3 -m http.server 3000
+python3 -m http.server 8899
 # ou
 npx serve .
 ```
 
-Abra `http://localhost:3000` em dois aparelhos na mesma rede (ou em duas abas).
+Abra `http://localhost:8899`.
+
+O motor de vídeo (`ffmpeg.wasm`) fica em `vendor/`:
+
+- `vendor/ffmpeg.js` e `vendor/814.ffmpeg.js` — wrapper (com o worker).
+- `vendor/ffmpeg-core.js` e `vendor/ffmpeg-core.wasm` — núcleo (single-thread).
+
+Eles são carregados do **mesmo domínio** (não dependem de CDN), então o app
+funciona offline/em qualquer ambiente.
 
 ## Deploy na Vercel
 
-É um site estático — sem build:
+Site estático, sem comando de build (Framework Preset **Other**). Basta publicar
+o repositório. Os arquivos `vendor/*` são servidos como assets estáticos.
 
-```bash
-vercel --prod
-```
+## Cenários testados
 
-Ou conecte diretamente este repositório na Vercel (Framework Preset = **Other**, sem comando de build).
-
-## Como usar
-
-1. No computador: **Iniciar no computador** → aparece um código de 6 caracteres.
-2. No celular: **Conectar (celular)** → digite o código → **Conectar**.
-3. Envie arquivos pelo botão ou arrastando para a área tracejada. Funciona nos
-   dois sentidos ao mesmo tempo.
-
-### 5. PC ↔ celular no 4G/5G (CGNAT)
-
-O Peer passa a ser criado com `PEER_CONFIG.iceServers`: STUN do Google/Twilio
-e TURN público `openrelay.metered.ca` (portas 80, 443 e `443?transport=tcp`,
-usuário/senha `openrelayproject`). Sem TURN, NAT simétrico das operadoras
-impede o furo de NAT.
-
-- `peer.on('disconnected')` chama `peer.reconnect()` se ainda estiver desconectado.
-- Estado ICE (`oniceconnectionstatechange`) aparece na tela (“Negociando rota de rede…”).
-- Timeout de join: 30s (TURN demora mais que STUN).
-- Erros por tipo: `peer-unavailable`, `network`, `server-error`.
-- CDN reserva do PeerJS via jsDelivr se o unpkg falhar.
-- O botão **Conectar** **nunca mais trava:**
-  - Antes, o `setTimeout` que o reabilitava ficava **dentro** de `peer.on('open')` —
-    se o serviço de sinalização não respondesse, o botão ficava desabilitado para sempre.
-  - Agora há **dois** timeouts: um para o broker de sinalização (mesma mensagem clara
-    se a internet cair) e outro para o TURN/ICE fechar a rota. Qualquer erro reabilita
-    o botão e mostra a mensagem.
-  - Se o **PeerJS não carregar** (CDN fora), o clique avisa “Não consegui iniciar o
-    PeerJS — verifique a conexão e recarregue a página” em vez de travar o botão.
-  - Clique duplo é ignorado (`disabled`), evitando tentativas simultâneas.
-
-### 6. Retry (tentar de novo)
-
-Arquivos que **falharam** (status *Erro*) ou foram **cancelados** (status
-*Cancelado*) agora têm o botão **Tentar novamente**, além do **Excluir**.
-
-- Ao clicar em **Tentar novamente**, o item volta para a **Fila** e é reenviado
-  automaticamente. O lado receptor descarta qualquer parcial antigo do mesmo
-  arquivo antes de recomeçar (sem duplicar itens na lista de Recebidos).
-- Se a conexão estiver fechada, o botão avisa *“Reconecte os aparelhos para
-  tentar de novo”* em vez de falhar silenciosamente.
-- O envio agora tenta de novo sozinho em **erros transitórios** (buffer cheio)
-  com retry/backoff: até 3 tentativas extras com espera crescente (250 → 600 →
-  1200 ms). Só marca erro de verdade quando todas falham.
-- Quando um envio falha, o outro lado é avisado (`cancel`) para descartar o
-  parcial logo de cara — nada de lixo acumulado na lista de Recebidos.
-- Se o canal cair no meio de um envio/recepção, o que estava em trânsito vira
-  *Erro* e pode ser **Tentar novamente** depois de reconectar.
-- Na tela do **host**, o botão **Novo código** regenera o código na hora — útil
-  quando a negociação TURN/ICE travou e você quer tentar de novo sem voltar ao
-  início.
-
-### 7. Conexão travada em loop (reconexão limitada, peer antes do código)
-
-Duas causas do app ficar preso em "conectando..." para sempre, corrigidas:
-
-- **Reconexão limitada:** `peer.on('disconnected')` chamava `peer.reconnect()`
-  sem teto — se o servidor de sinalização caísse de vez, o app entrava em loop
-  infinito de reconexão. Agora são no máximo **3 tentativas** com backoff
-  (1 s → 2 s → 4 s); o contador zera quando a conexão volta (`open`). Esgotadas
-  as tentativas, o peer é destruído e a tela pede para recarregar a página.
-- **Peer antes do código:** o código de 6 caracteres era exibido **antes** de o
-  peer existir no servidor de sinalização. O celular tentava conectar num ID
-  que ainda não estava registrado → `peer-unavailable` → o usuário tentava de
-  novo → loop. Agora o código só aparece **depois** do `peer.on('open')` —
-  enquanto isso a tela mostra "Preparando conexão...".
-
-### 8. TURN dedicado (Metered) sem configuração
-
-O endpoint serverless `api/turn-credentials.js` agora traz a chave da conta
-Metered **embutida** — o deploy funciona sem configurar nada na Vercel. Se a
-variável de ambiente `METERED_API_KEY` for configurada depois, **ela tem
-precedência** sobre a chave embutida. A chave nunca chega ao navegador: o
-cliente só recebe as credenciais TURN temporárias. Se o endpoint falhar, o
-`app.js` cai no fallback público (openrelay).
-
-## Limitação conhecida
-
-O arquivo recebido é montado na memória do navegador antes de virar download.
-Em celulares, arquivos acima de ~1–2 GB podem estourar a memória da aba. O envio
-não tem esse limite (é lido em fatias). Para suportar arquivos gigantes na
-recepção seria necessário usar a File System Access API ou StreamSaver.js.
+| Vídeo | Áudio | Loops | Duração final |
+|---|---|---|---|
+| 15 s | 2 min | 8 | 2:00 |
+| 30 s | 2 min 15 s | 4 + 15 s do 5º | 2:15 |
+| 1 min | 20 s | 1 (corta) | 0:20 |
+| 30 s | 2 min | 4 | 2:00 |
+| 30 s | 30 s | 1 | 0:30 |

@@ -6,149 +6,143 @@
       name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#0b1220" />
-    <title>FileLink Web</title>
+    <meta name="theme-color" content="#0d0a1a" />
+    <title>LoopSync</title>
     <meta
       name="description"
-      content="Envie arquivos direto de um aparelho para o outro pelo navegador, sem instalar nada."
+      content="Junte 1 vídeo + 1 música automaticamente. O vídeo é repetido até ficar com a duração exata da música."
     />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <canvas id="gl-bg" aria-hidden="true"></canvas>
-    <div class="glow glow-a" aria-hidden="true"></div>
-    <div class="glow glow-b" aria-hidden="true"></div>
-
+    <div class="aurora" id="aurora" aria-hidden="true"></div>
     <main class="wrap">
       <header class="head">
-        <p class="brand-mark">P2P</p>
-        <h1>FileLink Web</h1>
-        <p class="tagline">
-          Transferência direta entre seus aparelhos, pelo navegador.
-        </p>
+        <p class="brand-mark">LOOP</p>
+        <h1>LoopSync</h1>
+        <p class="tagline">Vídeo + música. Automaticamente.</p>
       </header>
 
-      <section class="screen is-active" id="screen-home">
-        <div class="choice">
-          <button class="btn btn-primary btn-big" id="btn-host">
-            <span class="btn-ico ico-host" aria-hidden="true"></span>
-            <span>
-              <strong>Iniciar no computador</strong>
-              <small>Gera um código para o outro aparelho</small>
-            </span>
-          </button>
-          <button class="btn btn-ghost btn-big" id="btn-join">
-            <span class="btn-ico ico-join" aria-hidden="true"></span>
-            <span>
-              <strong>Conectar (celular)</strong>
-              <small>Digite o código mostrado no outro aparelho</small>
-            </span>
-          </button>
-        </div>
-      </section>
+      <!-- ============ PASSO 1: ESCOLHER ARQUIVOS ============ -->
+      <section class="screen is-active" id="screen-pick">
+        <div class="mk msg" id="pick-msg" hidden></div>
 
-      <section class="screen" id="screen-host">
-        <p class="label">Código de conexão</p>
-        <div class="code" id="host-code">------</div>
-        <div class="row">
-          <button class="btn btn-soft" id="btn-copy-code">Copiar código</button>
-          <button class="btn btn-soft" id="btn-new-code">Novo código</button>
-        </div>
-        <p class="status" id="host-status">Aguardando conexão do celular...</p>
-        <button class="btn btn-link" data-back>Voltar</button>
-      </section>
-
-      <section class="screen" id="screen-join">
-        <p class="label">Digite o código do computador</p>
-        <input
-          id="join-code"
-          class="input-code"
-          inputmode="text"
-          autocomplete="off"
-          autocapitalize="characters"
-          spellcheck="false"
-          maxlength="6"
-          placeholder="ABC123"
-        />
-        <p class="status" id="join-status"></p>
-        <div class="row">
-          <button class="btn btn-primary" id="btn-connect">Conectar</button>
-        </div>
-        <button class="btn btn-link" data-back>Voltar</button>
-      </section>
-
-      <section class="screen" id="screen-transfer">
-        <p class="status ok" id="conn-status">Conectado</p>
-        <p class="status" id="ice-status"></p>
-
-        <div class="picker">
-          <input id="file-input" type="file" multiple hidden />
-          <button class="btn btn-primary btn-big" id="btn-pick">
-            <span class="btn-ico ico-send" aria-hidden="true"></span>
-            <span>
-              <strong>Enviar arquivo(s)</strong>
-              <small>Qualquer tipo: apk, pck, bin, zip, txt</small>
-            </span>
-          </button>
-          <div class="dropzone" id="dropzone">
-            ou arraste e solte os arquivos aqui
+        <!-- CARD 1 — VÍDEO -->
+        <div class="card">
+          <div class="card-head">
+            <span class="card-emoji">🎬</span>
+            <div>
+              <h2>Vídeo</h2>
+              <p class="card-state" id="video-state">Nenhum vídeo selecionado</p>
+            </div>
           </div>
-        </div>
-
-        <div class="panel" id="panel-queue" hidden>
-          <div class="panel-head">
-            <h2>Fila de envio <span class="count" id="queue-count">0</span></h2>
-            <button class="btn btn-tiny btn-danger-ghost" id="btn-clear-queue">
-              Cancelar tudo
+          <div class="card-file" id="video-file-view" hidden>
+            <div class="file-inner">
+              <span class="file-name" id="video-name"></span>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btn-clear-video" type="button">
+              Remover
             </button>
           </div>
-          <div class="groups" id="queue-groups"></div>
+          <button class="btn btn-soft btn-block" id="btn-pick-video" type="button">
+            Selecionar vídeo
+          </button>
+          <input id="file-video" type="file" accept="video/*" hidden />
         </div>
 
-        <div class="panel" id="panel-sent" hidden>
-          <div class="panel-head">
-            <h2>Enviados <span class="count" id="sent-count">0</span></h2>
-            <button class="btn btn-tiny btn-danger-ghost" id="btn-clear-sent">
-              Limpar lista
+        <!-- CARD 2 — ÁUDIO -->
+        <div class="card">
+          <div class="card-head">
+            <span class="card-emoji">🎵</span>
+            <div>
+              <h2>Áudio</h2>
+              <p class="card-state" id="audio-state">Nenhum áudio selecionado</p>
+            </div>
+          </div>
+          <div class="card-file" id="audio-file-view" hidden>
+            <div class="file-inner">
+              <span class="file-name" id="audio-name"></span>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btn-clear-audio" type="button">
+              Remover
             </button>
           </div>
-          <div class="groups" id="sent-groups"></div>
+          <button class="btn btn-soft btn-block" id="btn-pick-audio" type="button">
+            Selecionar áudio
+          </button>
+          <input id="file-audio" type="file" accept="audio/*" hidden />
         </div>
 
-        <div class="panel" id="panel-recv" hidden>
-          <div class="panel-head">
-            <h2>Recebidos <span class="count" id="recv-count">0</span></h2>
-            <button class="btn btn-tiny btn-danger-ghost" id="btn-clear-recv">
-              Limpar lista
+        <!-- INFORMAÇÕES -->
+        <div class="info" id="info" hidden>
+          <div class="info-title">Resumo da montagem</div>
+          <div class="info-grid">
+            <div class="info-item">
+              <span class="info-label">Duração do vídeo</span>
+              <span class="info-value" id="info-video">00:00</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Duração do áudio</span>
+              <span class="info-value" id="info-audio">00:00</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Loops necessários</span>
+              <span class="info-value" id="info-loops">0</span>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary btn-big" id="btn-generate" type="button" disabled>
+          Gerar vídeo
+        </button>
+      </section>
+
+      <!-- ============ PASSO 2: PROCESSANDO ============ -->
+      <section class="screen" id="screen-processing">
+        <div class="proc">
+          <div class="spinner" aria-hidden="true"></div>
+          <h2>Gerando seu vídeo...</h2>
+          <p class="proc-sub">Repetindo vídeo até o final do áudio</p>
+          <div class="progress"><i id="progress-fill"></i></div>
+          <p class="proc-pct" id="progress-pct">0%</p>
+          <p class="proc-log" id="progress-log"></p>
+        </div>
+        <div class="log-box" id="log-box"></div>
+      </section>
+
+      <!-- ============ PASSO 3: RESULTADO ============ -->
+      <section class="screen" id="screen-done">
+        <div class="done">
+          <div class="ok-badge" aria-hidden="true">✓</div>
+          <h2>Vídeo criado com sucesso!</h2>
+          <p class="done-duration" id="done-duration">Duração: 00:00</p>
+
+          <video id="result-video" class="result-video" controls playsinline></video>
+
+          <div class="done-actions">
+            <button class="btn btn-primary btn-block" id="btn-save" type="button">
+              Salvar vídeo
+            </button>
+            <button class="btn btn-soft btn-block" id="btn-share" type="button">
+              Compartilhar
+            </button>
+            <button class="btn btn-ghost btn-block" id="btn-again" type="button">
+              Criar outro
             </button>
           </div>
-          <div class="groups" id="recv-groups"></div>
         </div>
-
-        <button class="btn btn-link" data-back>Voltar</button>
       </section>
 
       <footer class="foot">
-        <p>Funciona direto no navegador, sem instalar nada.</p>
-        <p class="dim">
-          O handshake inicial usa um servidor público gratuito (precisa de
-          internet nesse momento), mas o arquivo em si vai direto de um aparelho
-          para o outro.
-        </p>
+        <p>Processado 100% no seu aparelho. Nada é enviado para servidores.</p>
+        <p class="dim">Seus arquivos não saem do dispositivo e são descartados ao final.</p>
       </footer>
     </main>
 
     <div class="toasts" id="toasts"></div>
 
-    <script
-      src="https://unpkg.com/three@0.160.0/build/three.min.js"
-      onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js'"
-    ></script>
-    <script src="./scene.js"></script>
-    <script
-      src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"
-      onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'"
-    ></script>
+    <!-- Motor de vídeo local (ffmpeg.wasm, single-thread) -->
+    <script src="./vendor/ffmpeg.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
